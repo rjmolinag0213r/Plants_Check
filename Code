@@ -1,0 +1,820 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, query, where, orderBy, onSnapshot, doc, addDoc, updateDoc, getDoc, serverTimestamp, setLogLevel } from 'firebase/firestore';
+import { Loader2, Plus, Droplet, HeartHandshake, Bot, ChevronLeft } from 'lucide-react'; // Changed Water to Droplet
+
+// --- Firebase and Configuration Globals (DO NOT EDIT THESE LINES) ---
+// These are provided by the canvas environment.
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+const API_KEY = "AIzaSyCAT3K__ATlOQn7Ok9z1e88-C6tt9QCoUM"; // Placeholder for Gemini API Key
+
+// Utility function for exponential backoff retry logic
+const withRetry = async (fn, maxRetries = 3) => {
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            return await fn();
+        } catch (error) {
+            console.error(`Attempt ${i + 1} failed:`, error);
+            if (i === maxRetries - 1) throw error;
+            await new Promise(resolve => setTimeout(resolve, Math.pow(2, i) * 1000));
+        }
+    }
+};
+
+// --- API FUNCTIONS ---
+
+/**
+ * Converts a File object to a Base64 string after resizing/compressing it.
+ * This is crucial to prevent hitting the 1MB Firestore document limit
+ * when storing the image data. Images are resized to 800x600 max and compressed.
+ * @param {File} file
+ * @returns {Promise<string>} Compressed Base64 string for inlineData.
+ */
+const fileToBase64 = (file) => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (event) => {
+            const img = new Image();
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                const MAX_WIDTH = 800; // Max width for the image
+                const MAX_HEIGHT = 600; // Max height for the image
+                let width = img.width;
+                let height = img.height;
+
+                // Determine new dimensions while maintaining aspect ratio
+                if (width > height) {
+                    if (width > MAX_WIDTH) {
+                        height *= MAX_WIDTH / width;
+                        width = MAX_WIDTH;
+                    }
+                } else {
+                    if (height > MAX_HEIGHT) {
+                        width *= MAX_HEIGHT / height;
+                        height = MAX_HEIGHT;
+                    }
+                }
+
+                canvas.width = width;
+                canvas.height = height;
+
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, width, height);
+
+                // Convert canvas to JPEG Base64 with compression (quality 0.7)
+                // This significantly reduces the size to avoid the Firestore 1MB limit.
+                const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+
+                // Extract only the base64 part
+                const base64String = dataUrl.split(',')[1];
+                resolve(base64String);
+            };
+            img.onerror = (error) => reject(error);
+            img.src = event.target.result;
+        };
+        reader.onerror = (error) => reject(error);
+        reader.readAsDataURL(file);
+    });
+};
+
+/**
+ * Calls the Gemini API for multi-modal analysis.
+ * @param {string} base64Image - Base64 string of the image.
+ * @param {string} userPrompt - The specific task/question for the image.
+ * @param {object} responseSchema - Optional JSON schema for structured output.
+ * @param {string} systemPrompt - Instructions for the model's persona.
+ * @returns {Promise<any>} The parsed JSON or text response.
+ */
+const callGeminiApi = async (base64Image, userPrompt, responseSchema, systemPrompt) => {
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${API_KEY}`;
+
+    const contents = [
+        {
+            role: "user",
+            parts: [
+                { text: userPrompt },
+                {
+                    inlineData: {
+                        mimeType: "image/jpeg", // Assuming JPEG for simplicity
+                        data: base64Image
+                    }
+                }
+            ]
+        }
+    ];
+
+    const payload = {
+        contents: contents,
+        systemInstruction: {
+            parts: [{ text: systemPrompt }]
+        },
+    };
+
+    if (responseSchema) {
+        payload.generationConfig = {
+            responseMimeType: "application/json",
+            responseSchema: responseSchema
+        };
+    }
+
+    const fetchRequest = async () => {
+        const response = await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            const errorBody = await response.text();
+            throw new Error(`Gemini API error: ${response.status} - ${errorBody}`);
+        }
+
+        const result = await response.json();
+        const textPart = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+        if (!textPart) {
+            throw new Error("API response was missing expected content.");
+        }
+
+        if (responseSchema) {
+            try {
+                return JSON.parse(textPart);
+            } catch (e) {
+                console.error("Failed to parse JSON response:", textPart);
+                throw new Error("Invalid JSON structure returned by model.");
+            }
+        }
+        return textPart;
+    };
+
+    return withRetry(fetchRequest);
+};
+
+
+// --- FIREBASE CONTEXT & HOOKS ---
+
+// Global variables for Firebase services
+let app, db, auth;
+
+export default function App() {
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [plants, setPlants] = useState([]);
+    const [currentView, setCurrentView] = useState('list'); // 'list', 'add', 'checkin', 'details'
+    const [selectedPlant, setSelectedPlant] = useState(null);
+
+    // 1. Firebase Initialization and Authentication
+    useEffect(() => {
+        if (!firebaseConfig.apiKey) {
+            console.error("Firebase config is missing. Cannot initialize Firestore.");
+            return;
+        }
+
+        // Set log level to Debug for visibility
+        setLogLevel('Debug');
+
+        try {
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+        } catch (e) {
+            console.error("Error initializing Firebase:", e);
+            return;
+        }
+
+        // Sign in logic
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                setUserId(user.uid);
+            } else {
+                setUserId(null); // Should not happen after initial sign-in, but good practice
+            }
+            setIsAuthReady(true);
+        });
+
+        const authenticate = async () => {
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                    console.log("Signed in with custom token.");
+                } else {
+                    await signInAnonymously(auth);
+                    console.log("Signed in anonymously.");
+                }
+            } catch (error) {
+                console.error("Authentication failed:", error);
+            }
+        };
+
+        if (!auth.currentUser) {
+            authenticate();
+        }
+
+    }, []);
+
+    // 2. Data Listener (onSnapshot)
+    useEffect(() => {
+        if (!isAuthReady || !userId || !db) return;
+
+        console.log(`Setting up plant listener for user: ${userId}`);
+        const plantsCollectionRef = collection(db, 'artifacts', appId, 'users', userId, 'plants');
+        const q = query(plantsCollectionRef);
+
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const fetchedPlants = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+            setPlants(fetchedPlants);
+            console.log(`Fetched ${fetchedPlants.length} plants.`);
+        }, (error) => {
+            console.error("Error listening to plants collection:", error);
+        });
+
+        return () => unsubscribe();
+    }, [isAuthReady, userId]);
+
+    // --- Components ---
+
+    const PlantCard = ({ plant }) => {
+        const nextReminderDate = plant.nextReminder?.toDate();
+        const now = new Date();
+        const needsAttention = nextReminderDate && nextReminderDate <= now;
+
+        const handleCheckInClick = () => {
+            setSelectedPlant(plant);
+            setCurrentView('checkin');
+        };
+
+        const handleDetailsClick = () => {
+            setSelectedPlant(plant);
+            setCurrentView('details');
+        };
+
+        return (
+            <div className="bg-white p-4 rounded-xl shadow-lg border border-green-100 flex flex-col transition duration-300 ease-in-out hover:shadow-xl hover:border-green-300">
+                <h3 className="text-xl font-bold text-green-800 truncate mb-1">{plant.name}</h3>
+                <p className="text-sm text-gray-500 mb-3">{plant.speciesInfo?.speciesName || 'Species Unknown'}</p>
+
+                <div className="flex items-center justify-between text-sm mb-4">
+                    <div className="flex items-center text-gray-600">
+                        <HeartHandshake className="w-4 h-4 mr-1 text-pink-500" />
+                        Last Check-in:
+                    </div>
+                    <span className="font-medium text-gray-800">
+                        {plant.lastCheckIn?.toDate().toLocaleDateString()}
+                    </span>
+                </div>
+
+                <div className="flex items-center justify-between text-sm mb-4">
+                    <div className="flex items-center text-gray-600">
+                        <Droplet className="w-4 h-4 mr-1 text-blue-500" /> {/* Changed Water to Droplet */}
+                        Next Reminder:
+                    </div>
+                    {/* The date is always displayed, but highlighted if attention is needed */}
+                    <span className={`font-semibold ${needsAttention ? 'text-red-600 animate-pulse' : 'text-green-600'}`}>
+                        {nextReminderDate ? nextReminderDate.toLocaleDateString() : 'N/A'}
+                    </span>
+                </div>
+
+                {needsAttention && (
+                    <p className="text-xs text-red-500 bg-red-50 p-2 rounded-lg mb-2 flex items-center justify-center font-medium">
+                        Time to water and check-in!
+                    </p>
+                )}
+
+                <div className="mt-auto flex space-x-2 pt-2">
+                    <button
+                        onClick={handleDetailsClick}
+                        className="flex-1 bg-green-500 hover:bg-green-600 text-white font-semibold py-2 px-3 rounded-xl transition shadow-md hover:shadow-lg text-sm"
+                    >
+                        View Details
+                    </button>
+                    {/* The Check-in button is now always enabled for manual check-in */}
+                    <button
+                        onClick={handleCheckInClick}
+                        className="py-2 px-3 rounded-xl transition text-sm font-semibold bg-blue-500 hover:bg-blue-600 text-white shadow-md hover:shadow-lg"
+                    >
+                        Check-in Now
+                    </button>
+                </div>
+            </div>
+        );
+    };
+
+    const PlantList = () => (
+        <div className="p-4 sm:p-8">
+            <h1 className="text-3xl font-extrabold text-green-900 mb-6">Your Plant Garden</h1>
+
+            <button
+                onClick={() => setCurrentView('add')}
+                className="w-full mb-8 flex items-center justify-center p-4 bg-lime-600 text-white rounded-xl shadow-lg hover:bg-lime-700 transition duration-300 font-bold text-lg"
+            >
+                <Plus className="w-5 h-5 mr-2" /> Add a New Plant
+            </button>
+
+            {plants.length === 0 ? (
+                <div className="text-center p-10 bg-green-50 rounded-xl border border-dashed border-green-300">
+                    <p className="text-gray-600 text-lg">You haven't added any plants yet!</p>
+                    <p className="text-gray-400 text-sm mt-1">Click the button above to start tracking your first plant.</p>
+                </div>
+            ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                    {plants.map(plant => <PlantCard key={plant.id} plant={plant} />)}
+                </div>
+            )}
+        </div>
+    );
+
+    const AddPlantView = () => {
+        const [plantName, setPlantName] = useState('');
+        const [imageFile, setImageFile] = useState(null);
+        const [previewUrl, setPreviewUrl] = useState(null);
+        const [loading, setLoading] = useState(false);
+        const [error, setError] = useState(null);
+
+        const handleFileChange = (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                setImageFile(file);
+                setPreviewUrl(URL.createObjectURL(file));
+            } else {
+                setImageFile(null);
+                setPreviewUrl(null);
+            }
+        };
+
+        const handleSubmit = async (e) => {
+            e.preventDefault();
+            if (!plantName || !imageFile) {
+                setError("Please provide a name and an image for your plant.");
+                return;
+            }
+
+            setLoading(true);
+            setError(null);
+
+            try {
+                // 1. Convert image to Base64 (with resizing/compression to avoid Firestore 1MB limit)
+                const base64Image = await fileToBase64(imageFile);
+
+                // 2. Call LLM for initial analysis (structured response)
+                const speciesSchema = {
+                    type: "OBJECT",
+                    properties: {
+                        speciesName: { type: "STRING", description: "The common name of the plant species." },
+                        scientificName: { type: "STRING", description: "The scientific name (Genus species) of the plant." },
+                        basicCareSummary: { type: "STRING", description: "A concise, single-sentence summary of its basic care needs (e.g., light, water frequency)." }
+                    },
+                    required: ["speciesName", "scientificName", "basicCareSummary"]
+                };
+
+                const speciesSystemPrompt = "You are an expert botanist and plant care specialist. Your goal is to identify the plant from the image and provide concise, structured basic information for a beginner gardener.";
+                const speciesUserPrompt = "Identify the species of the plant in this image. Provide the common name, scientific name, and a one-sentence summary of its basic care needs.";
+
+                const speciesInfo = await callGeminiApi(
+                    base64Image,
+                    speciesUserPrompt,
+                    speciesSchema,
+                    speciesSystemPrompt
+                );
+
+                // 3. Prepare initial check-in report
+                const reportSystemPrompt = "You are a friendly, encouraging plant care coach. Based on this first image, give a simple, positive initial assessment of the plant's current state.";
+                const reportUserPrompt = `This is the initial picture of my plant named ${plantName}. Please provide a brief initial assessment and a first positive care tip.`;
+                const initialReport = await callGeminiApi(
+                    base64Image,
+                    reportUserPrompt,
+                    null, // No structured schema needed here
+                    reportSystemPrompt
+                );
+
+                // 4. Calculate next reminder (7 days from now)
+                const now = new Date();
+                const nextReminder = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+                // 5. Add Plant Document
+                const plantsCollectionRef = collection(db, 'artifacts', appId, 'users', userId, 'plants');
+                const newPlantRef = await addDoc(plantsCollectionRef, {
+                    name: plantName,
+                    speciesInfo: speciesInfo,
+                    lastCheckIn: serverTimestamp(),
+                    nextReminder: nextReminder,
+                });
+
+                // 6. Add Initial Check-in to Subcollection
+                const checkInCollectionRef = collection(db, 'artifacts', appId, 'users', userId, 'plants', newPlantRef.id, 'checkIns');
+                await addDoc(checkInCollectionRef, {
+                    date: serverTimestamp(),
+                    imageBase64: base64Image,
+                    report: initialReport,
+                    tips: "N/A (Initial assessment)",
+                    checkInType: "initial",
+                });
+
+                setCurrentView('list');
+                setPlantName('');
+                setImageFile(null);
+                setPreviewUrl(null);
+            } catch (err) {
+                console.error("Error adding plant or calling API:", err);
+                setError(`Failed to save plant or analyze image. Error: ${err.message}`);
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        return (
+            <div className="p-4 sm:p-8">
+                <button onClick={() => setCurrentView('list')} className="flex items-center text-green-700 hover:text-green-900 mb-6 font-medium">
+                    <ChevronLeft className="w-5 h-5 mr-1" /> Back to Plants
+                </button>
+                <h1 className="text-3xl font-bold text-green-800 mb-6">Add New Plant</h1>
+
+                <div className="max-w-xl mx-auto bg-white p-6 rounded-xl shadow-2xl border-t-4 border-lime-600">
+                    <form onSubmit={handleSubmit} className="space-y-6">
+                        <div>
+                            <label htmlFor="plant-name" className="block text-sm font-medium text-gray-700 mb-1">Plant Nickname</label>
+                            <input
+                                id="plant-name"
+                                type="text"
+                                value={plantName}
+                                onChange={(e) => setPlantName(e.target.value)}
+                                placeholder="e.g., Fernie Sanders or Sunny"
+                                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-lime-500 focus:border-lime-500"
+                                disabled={loading}
+                            />
+                        </div>
+
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-1">
+                                Initial Picture (for identification and baseline)
+                            </label>
+                            <input
+                                type="file"
+                                accept="image/*"
+                                onChange={handleFileChange}
+                                className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-lime-50 file:text-lime-700 hover:file:bg-lime-100"
+                                disabled={loading}
+                            />
+                        </div>
+
+                        {previewUrl && (
+                            <div className="mt-4">
+                                <p className="text-sm font-medium text-gray-700 mb-2">Image Preview:</p>
+                                <img src={previewUrl} alt="Plant Preview" className="w-full max-h-64 object-cover rounded-lg shadow-md" />
+                            </div>
+                        )}
+
+                        {error && (
+                            <div className="p-3 bg-red-100 border-l-4 border-red-500 text-red-700 rounded-lg">
+                                {error}
+                            </div>
+                        )}
+
+                        <button
+                            type="submit"
+                            disabled={loading}
+                            className={`w-full flex items-center justify-center p-3 font-bold text-white rounded-xl transition duration-300 ${loading ? 'bg-gray-400 cursor-not-allowed' : 'bg-lime-600 hover:bg-lime-700 shadow-md'}`}
+                        >
+                            {loading ? (
+                                <><Loader2 className="w-5 h-5 mr-2 animate-spin" /> Analyzing and Saving...</>
+                            ) : (
+                                'Analyze and Start Tracking'
+                            )}
+                        </button>
+                    </form>
+                </div>
+            </div>
+        );
+    };
+
+    const CheckInView = () => {
+        const plant = selectedPlant;
+        const [imageFile, setImageFile] = useState(null);
+        const [previewUrl, setPreviewUrl] = useState(null);
+        const [loading, setLoading] = useState(false);
+        const [error, setError] = useState(null);
+
+        if (!plant) {
+            setCurrentView('list');
+            return null;
+        }
+
+        const handleFileChange = (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                setImageFile(file);
+                setPreviewUrl(URL.createObjectURL(file));
+            } else {
+                setImageFile(null);
+                setPreviewUrl(null);
+            }
+        };
+
+        const handleSubmitCheckIn = async (e) => {
+            e.preventDefault();
+            if (!imageFile) {
+                setError("Please upload a new picture for the progress analysis.");
+                return;
+            }
+
+            setLoading(true);
+            setError(null);
+
+            try {
+                // 1. Convert image to Base64 (with resizing/compression to avoid Firestore 1MB limit)
+                const base64Image = await fileToBase64(imageFile);
+
+                // 2. Call LLM for progress report and tips
+                const reportSystemPrompt = "You are a friendly, encouraging plant care coach. Analyze the plant's condition from the image and provide a supportive progress report, followed by one actionable, specific tip for improving its health over the next week. The output must be two distinct sections: 'Progress Report:' and 'Care Tip:' with a clear newline separating them.";
+                const reportUserPrompt = `I am checking in on my ${plant.name}, a ${plant.speciesInfo?.speciesName || 'plant'}. Please analyze its condition, assess its progress since the last check-in, and provide a single, actionable care tip for the next 7 days.`;
+
+                const rawReport = await callGeminiApi(
+                    base64Image,
+                    reportUserPrompt,
+                    null, // Simple text response
+                    reportSystemPrompt
+                );
+
+                // Split the raw report into structured fields
+                const [reportSection, tipSection] = rawReport.split(/\nCare Tip:/);
+                const progressReport = reportSection?.replace("Progress Report:", "").trim() || rawReport;
+                const careTips = tipSection?.trim() || "No specific tip generated.";
+
+
+                // 3. Calculate next reminder (7 days from now)
+                const now = new Date();
+                const nextReminder = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+                // 4. Add new Check-in to Subcollection
+                const checkInCollectionRef = collection(db, 'artifacts', appId, 'users', userId, 'plants', plant.id, 'checkIns');
+                await addDoc(checkInCollectionRef, {
+                    date: serverTimestamp(),
+                    imageBase64: base64Image,
+                    report: progressReport,
+                    tips: careTips,
+                    checkInType: "progress",
+                });
+
+                // 5. Update Plant Document metadata
+                const plantDocRef = doc(db, 'artifacts', appId, 'users', userId, 'plants', plant.id);
+                await updateDoc(plantDocRef, {
+                    lastCheckIn: serverTimestamp(),
+                    nextReminder: nextReminder,
+                });
+
+                setCurrentView('details');
+            } catch (err) {
+                console.error("Error during check-in or API call:", err);
+                setError(`Failed to process check-in or analyze image. Error: ${err.message}`);
+            } finally {
+                setLoading(false);
+            }
+        };
+
+        return (
+            <div className="p-4 sm:p-8">
+                <button onClick={() => setCurrentView('list')} className="flex items-center text-green-700 hover:text-green-900 mb-6 font-medium">
+                    <ChevronLeft className="w-5 h-5 mr-1" /> Back to Plants
+                </button>
+                <h1 className="text-3xl font-bold text-green-800 mb-2">Check-in for {plant.name}</h1>
+                <p className="text-gray-500 mb-6">You are performing a **Manual Check-in**. Your next reminder will be automatically updated.</p>
+
+                <div className="max-w-xl mx-auto bg-white p-6 rounded-xl shadow-2xl border-t-4 border-blue-600">
+                    <form onSubmit={handleSubmitCheckIn} className="space-y-6">
+                        <div className="p-4 bg-blue-50 border border-blue-200 rounded-lg text-blue-800 flex items-start">
+                            <Droplet className="w-5 h-5 mr-3 mt-1 text-blue-500 flex-shrink-0" /> {/* Changed Water to Droplet */}
+                            <div>
+                                <h3 className="font-bold text-lg">Action Required</h3>
+                                <p className="text-sm">Water your plant, then take a new photo to analyze its current progress.</p>
+                            </div>
+                        </div>
+
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-1">
+                                Progress Picture (New Photo)
+                            </label>
+                            <input
+                                type="file"
+                                accept="image/*"
+                                onChange={handleFileChange}
+                                className="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"
+                                disabled={loading}
+                                required
+                            />
+                        </div>
+
+                        {previewUrl && (
+                            <div className="mt-4">
+                                <p className="text-sm font-medium text-gray-700 mb-2">New Photo Preview:</p>
+                                <img src={previewUrl} alt="New Plant Progress Preview" className="w-full max-h-64 object-cover rounded-lg shadow-md" />
+                            </div>
+                        )}
+
+                        {error && (
+                            <div className="p-3 bg-red-100 border-l-4 border-red-500 text-red-700 rounded-lg">
+                                {error}
+                            </div>
+                        )}
+
+                        <button
+                            type="submit"
+                            disabled={loading || !imageFile}
+                            className={`w-full flex items-center justify-center p-3 font-bold text-white rounded-xl transition duration-300 ${loading ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 shadow-md'}`}
+                        >
+                            {loading ? (
+                                <><Loader2 className="w-5 h-5 mr-2 animate-spin" /> Analyzing Progress...</>
+                            ) : (
+                                'Submit Check-in & Get Report'
+                            )}
+                        </button>
+                    </form>
+                </div>
+            </div>
+        );
+    };
+
+    const PlantDetailsView = () => {
+        const plant = selectedPlant;
+        const [checkIns, setCheckIns] = useState([]);
+        const [isLoadingHistory, setIsLoadingHistory] = useState(true);
+
+        // Fetch Check-in History
+        useEffect(() => {
+            if (!plant || !db || !userId) return;
+
+            setIsLoadingHistory(true);
+            const checkInCollectionRef = collection(db, 'artifacts', appId, 'users', userId, 'plants', plant.id, 'checkIns');
+            const q = query(checkInCollectionRef, orderBy('date', 'desc'));
+
+            const unsubscribe = onSnapshot(q, (snapshot) => {
+                const history = snapshot.docs.map(doc => ({
+                    id: doc.id,
+                    ...doc.data()
+                }));
+                setCheckIns(history);
+                setIsLoadingHistory(false);
+            }, (error) => {
+                console.error("Error fetching check-in history:", error);
+                setIsLoadingHistory(false);
+            });
+
+            return () => unsubscribe();
+        }, [plant, userId]);
+
+        if (!plant) {
+            setCurrentView('list');
+            return null;
+        }
+
+        return (
+            <div className="p-4 sm:p-8">
+                <button onClick={() => setCurrentView('list')} className="flex items-center text-green-700 hover:text-green-900 mb-6 font-medium">
+                    <ChevronLeft className="w-5 h-5 mr-1" /> Back to Plants
+                </button>
+                <div className="flex flex-col md:flex-row gap-6">
+                    {/* Sidebar: Plant Info */}
+                    <div className="md:w-1/3 bg-white p-6 rounded-xl shadow-2xl h-fit sticky top-0 border-t-4 border-green-500">
+                        <h1 className="text-3xl font-bold text-green-800 mb-2">{plant.name}</h1>
+                        <p className="text-lg text-gray-500 mb-4">{plant.speciesInfo?.scientificName || 'No scientific name provided'}</p>
+
+                        <div className="space-y-4">
+                            <div className="p-3 bg-green-50 rounded-lg">
+                                <h3 className="font-semibold text-green-700 flex items-center mb-1">
+                                    <Bot className="w-4 h-4 mr-2" />
+                                    Species: {plant.speciesInfo?.speciesName || 'Unknown'}
+                                </h3>
+                                <p className="text-sm text-gray-600">
+                                    {plant.speciesInfo?.basicCareSummary || 'No basic care info available.'}
+                                </p>
+                            </div>
+                            <div className="p-3 bg-yellow-50 rounded-lg">
+                                <h3 className="font-semibold text-yellow-700 flex items-center mb-1">
+                                    <Droplet className="w-4 h-4 mr-2" /> {/* Changed Water to Droplet */}
+                                    Last Check-in
+                                </h3>
+                                <p className="text-sm text-gray-700">
+                                    {plant.lastCheckIn?.toDate().toLocaleString()}
+                                </p>
+                            </div>
+                            <div className="p-3 bg-blue-50 rounded-lg">
+                                <h3 className="font-semibold text-blue-700 flex items-center mb-1">
+                                    <HeartHandshake className="w-4 h-4 mr-2" />
+                                    Next Reminder
+                                </h3>
+                                <p className="text-sm text-gray-700 font-bold">
+                                    {plant.nextReminder?.toDate().toLocaleDateString()}
+                                </p>
+                            </div>
+                        </div>
+
+                    </div>
+
+                    {/* Main Content: History */}
+                    <div className="md:w-2/3">
+                        <h2 className="text-2xl font-bold text-green-800 mb-4 border-b pb-2">Progress History ({checkIns.length} Entries)</h2>
+
+                        {isLoadingHistory ? (
+                            <div className="flex justify-center items-center h-48 bg-gray-50 rounded-xl">
+                                <Loader2 className="w-8 h-8 animate-spin text-lime-600" />
+                                <span className="ml-3 text-gray-600">Loading history...</span>
+                            </div>
+                        ) : checkIns.length === 0 ? (
+                            <div className="p-6 bg-yellow-50 rounded-xl text-yellow-800 border border-yellow-200">No check-in history found.</div>
+                        ) : (
+                            <div className="space-y-8">
+                                {checkIns.map((checkIn, index) => (
+                                    <div key={checkIn.id} className="bg-white p-5 rounded-xl shadow-md border-l-4 border-lime-500">
+                                        <div className="flex justify-between items-center mb-4 border-b pb-3">
+                                            <h3 className="text-xl font-bold text-gray-800">
+                                                Check-in on {checkIn.date?.toDate().toLocaleDateString()}
+                                                {checkIn.checkInType === 'initial' && <span className="ml-2 px-2 py-1 text-xs font-medium bg-green-200 text-green-800 rounded-full">Initial Setup</span>}
+                                            </h3>
+                                        </div>
+
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            {/* Progress Photo */}
+                                            <div className="bg-gray-100 rounded-lg p-2">
+                                                <p className="font-medium text-sm text-gray-700 mb-2">Plant Photo:</p>
+                                                <img
+                                                    src={`data:image/jpeg;base64,${checkIn.imageBase64}`}
+                                                    alt={`Check-in ${index + 1}`}
+                                                    className="w-full h-48 object-cover rounded-lg shadow-sm"
+                                                />
+                                            </div>
+
+                                            {/* Report */}
+                                            <div className="space-y-3">
+                                                <div className="p-3 bg-indigo-50 rounded-lg border border-indigo-200">
+                                                    <h4 className="font-bold text-indigo-700 flex items-center mb-1">
+                                                        <Bot className="w-4 h-4 mr-2" /> Progress Report
+                                                    </h4>
+                                                    <p className="text-sm text-gray-800 whitespace-pre-line">{checkIn.report}</p>
+                                                </div>
+
+                                                {checkIn.checkInType === 'progress' && (
+                                                    <div className="p-3 bg-teal-50 rounded-lg border border-teal-200">
+                                                        <h4 className="font-bold text-teal-700 flex items-center mb-1">
+                                                            <Droplet className="w-4 h-4 mr-2" /> {/* Changed Water to Droplet */}
+                                                            Care Tip for Next Week
+                                                        </h4>
+                                                        <p className="text-sm text-gray-800 whitespace-pre-line">{checkIn.tips}</p>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+
+    const MainContent = () => {
+        if (!isAuthReady) {
+            return (
+                <div className="flex flex-col items-center justify-center min-h-screen bg-green-50">
+                    <Loader2 className="w-12 h-12 text-lime-600 animate-spin mb-4" />
+                    <p className="text-lg text-gray-700">Connecting to the Garden...</p>
+                </div>
+            );
+        }
+
+        switch (currentView) {
+            case 'add':
+                return <AddPlantView />;
+            case 'checkin':
+                return <CheckInView />;
+            case 'details':
+                return <PlantDetailsView />;
+            case 'list':
+            default:
+                return <PlantList />;
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-green-50 font-sans">
+            <header className="bg-white shadow-md p-4 sticky top-0 z-10">
+                <div className="flex justify-between items-center max-w-6xl mx-auto">
+                    <h1 className="text-2xl font-black text-lime-700 flex items-center">
+                        <span className="text-4xl mr-2">🌿</span>
+                        Green Guardian
+                    </h1>
+                    <span className="text-xs text-gray-400">User ID: {userId || 'Authenticating...'}</span>
+                </div>
+            </header>
+            <main className="max-w-6xl mx-auto py-8">
+                <MainContent />
+            </main>
+        </div>
+    );
+}
