@@ -9,7 +9,7 @@ import { Loader2, Plus, Droplet, HeartHandshake, Bot, ChevronLeft } from 'lucide
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
 const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
-const API_KEY = "AIzaSyCAT3K__ATlOQn7Ok9z1e88-C6tt9QCoUM"; // Placeholder for Gemini API Key
+const API_KEY = "Key Here"; // Placeholder for Gemini API Key
 
 // Utility function for exponential backoff retry logic
 const withRetry = async (fn, maxRetries = 3) => {
@@ -818,3 +818,4 @@ export default function App() {
         </div>
     );
 }
+
